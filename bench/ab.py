@@ -72,7 +72,7 @@ def predict_args(n=16):
         u=np.ascontiguousarray(np.empty(1)),
         x=np.ascontiguousarray(rng.normal(size=n)),
         cov=np.ascontiguousarray(np.eye(n)),
-        xw=np.empty(n), pw=np.empty((n, n)), n=n,
+        xw=np.empty(n), pw=np.empty(2 * n * n), n=n,
     )
     a["addr"] = (ad(a["f"]), ad(a["cov"]), ad(a["f"]), ad(a["q"]), ad(a["b"]),
                  ad(a["u"]), ad(a["xw"]), ad(a["pw"]), n, 0, 1.0)
@@ -111,12 +111,14 @@ def ut_args(k=65, n=32):
     return a
 
 
-def binary_args(n=200_000, buckets=1 << 16):
+def binary_args(n=200_000, buckets=None):
     rng = np.random.default_rng(1)
     w = rng.random(n)
     w /= w.sum()
     cum = np.ascontiguousarray(np.cumsum(w))
     cum[-1] = 1.0
+    if buckets is None:
+        buckets = max(min(n, 1 << 20), 1)
     a = dict(cum=cum, pos=np.ascontiguousarray(rng.random(n)),
              idx=np.empty(n, dtype=np.int64), table=np.zeros(buckets + 2, dtype=np.int64),
              buckets=buckets, n=n)

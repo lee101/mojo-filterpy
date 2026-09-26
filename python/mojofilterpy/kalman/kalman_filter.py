@@ -4,11 +4,13 @@ from copy import deepcopy
 
 import numpy as np
 
-from .._lib import addr, f64, lib
+from .._lib import addr, f64, lib, scratch
 from .._stats import LikelihoodMixin
 
 
 def _noise(value, n: int) -> np.ndarray:
+    if type(value) is np.ndarray:
+        return f64(value)
     if np.isscalar(value):
         return np.eye(n) * float(value)
     return f64(value)
@@ -21,56 +23,84 @@ def _reshape_z(z, dim_z: int, ndim: int):
     return z.reshape(dim_z) if ndim == 1 else z.reshape(dim_z, 1)
 
 
+_DUMMY = np.empty(1, dtype=np.float64)
+_DUMMY_ADDR = int(_DUMMY.ctypes.data)
+
+
 def _predict(x, P, F, Q, B, u, alpha_sq=1.0):
-    shape = np.asarray(x).shape
-    xv = f64(x, copy=True).reshape(-1)
+    source = np.asarray(x)
+    shape = source.shape
+    xv = f64(source, copy=True)
     n = xv.size
     if n == 0:
         raise ValueError("state must be non-empty")
-    cov = f64(P, copy=True).reshape(n, n)
-    fm = f64(F).reshape(n, n)
-    qm = f64(_noise(Q, n)).reshape(n, n)
+    if xv.ndim != 1:
+        xv = xv.reshape(n)
+    cov = f64(P, copy=True)
+    if cov.shape != (n, n):
+        cov = cov.reshape(n, n)
+    fm = f64(F)
+    if fm.shape != (n, n):
+        fm = fm.reshape(n, n)
+    qm = f64(_noise(Q, n))
+    if qm.shape != (n, n):
+        qm = qm.reshape(n, n)
     nu = 0
-    bm = np.empty(1, dtype=np.float64)
-    uv = np.empty(1, dtype=np.float64)
+    bm = uv = None
+    bm_addr = uv_addr = _DUMMY_ADDR
     if B is not None and u is not None and not np.isscalar(B):
-        uv = f64(u).reshape(-1)
+        uv = f64(u)
+        if uv.ndim != 1:
+            uv = uv.reshape(-1)
         nu = uv.size
-        bm = f64(B).reshape(n, nu)
-    xw = np.empty(n, dtype=np.float64)
-    pw = np.empty((n, n), dtype=np.float64)
+        bm = f64(B)
+        if bm.shape != (n, nu):
+            bm = bm.reshape(n, nu)
+        bm_addr, uv_addr = addr(bm), addr(uv)
+    _, xw_addr = scratch(n)
+    _, work_addr = scratch(2 * n * n)
     lib().mfp_predict(
-        addr(xv), addr(cov), addr(fm), addr(qm), addr(bm), addr(uv),
-        addr(xw), addr(pw), n, nu, alpha_sq,
+        addr(xv), addr(cov), addr(fm), addr(qm), bm_addr, uv_addr,
+        xw_addr, work_addr, n, nu, alpha_sq,
     )
-    return xv.reshape(shape), cov
+    return xv if xv.shape == shape else xv.reshape(shape), cov
 
 
 def _linear_update(x, P, H, R, y):
-    shape = np.asarray(x).shape
-    xv = f64(x, copy=True).reshape(-1)
+    source = np.asarray(x)
+    shape = source.shape
+    xv = f64(source, copy=True)
     n = xv.size
     if n == 0:
         raise ValueError("state must be non-empty")
-    cov = f64(P, copy=True).reshape(n, n)
+    if xv.ndim != 1:
+        xv = xv.reshape(n)
+    cov = f64(P, copy=True)
+    if cov.shape != (n, n):
+        cov = cov.reshape(n, n)
     hm = f64(H)
     if hm.ndim != 2 or hm.shape[0] == 0:
         raise ValueError("H must be a non-empty two-dimensional matrix")
     m = hm.shape[0]
-    hm = hm.reshape(m, n)
-    rm = f64(_noise(R, m)).reshape(m, m)
-    yv = f64(y).reshape(m)
+    if hm.shape != (m, n):
+        hm = hm.reshape(m, n)
+    rm = f64(_noise(R, m))
+    if rm.shape != (m, m):
+        rm = rm.reshape(m, m)
+    yv = f64(y)
+    if yv.ndim != 1:
+        yv = yv.reshape(m)
     gain = np.empty((n, m), dtype=np.float64)
     s = np.empty((m, m), dtype=np.float64)
     si = np.empty((m, m), dtype=np.float64)
-    work = np.empty(2 * n * n + 2 * m * m + n * m, dtype=np.float64)
+    _, work_addr = scratch(2 * n * n + 2 * m * m + n * m)
     ok = lib().mfp_linear_update(
         addr(xv), addr(cov), addr(hm), addr(rm), addr(yv), addr(gain),
-        addr(s), addr(si), addr(work), n, m,
+        addr(s), addr(si), work_addr, n, m,
     )
     if not ok:
         raise np.linalg.LinAlgError("innovation covariance is singular")
-    return xv.reshape(shape), cov, gain, s, si
+    return (xv if xv.shape == shape else xv.reshape(shape)), cov, gain, s, si
 
 
 class KalmanFilter(LikelihoodMixin):

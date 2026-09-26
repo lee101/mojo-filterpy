@@ -46,18 +46,24 @@ def lib() -> ctypes.CDLL:
     return _library
 
 
-def scratch(count: int) -> tuple[np.ndarray, int]:
-    """Thread-local float64 scratch buffer together with its cached address."""
+def scratch(count: int, dtype=np.float64) -> tuple[np.ndarray, int]:
+    """Thread-local scratch buffer together with its cached address."""
     pool = getattr(_POOL, "buffers", None)
     if pool is None:
         pool = {}
         _POOL.buffers = pool
-    entry = pool.get(count)
+    key = (count, dtype)
+    entry = pool.get(key)
     if entry is None:
-        buffer = np.empty(count, dtype=np.float64)
+        buffer = np.empty(count, dtype=dtype)
         entry = (buffer, int(buffer.ctypes.data))
-        pool[count] = entry
+        pool[key] = entry
     return entry
+
+
+def bucket_count(n: int) -> int:
+    """Search-table size: one bucket per entry, capped so the table stays cacheable."""
+    return max(min(n, 1 << 20), 1)
 
 
 def f64(value, *, copy: bool = False) -> np.ndarray:
@@ -85,6 +91,13 @@ def i64(value) -> np.ndarray:
     return np.ascontiguousarray(value, dtype=np.int64)
 
 
+def _data_pointer(array: np.ndarray) -> int:
+    try:
+        return ctypes.addressof(ctypes.c_char.from_buffer(array))
+    except TypeError:
+        return int(array.ctypes.data)
+
+
 def _reject(array) -> None:
     if not isinstance(array, np.ndarray):
         raise TypeError("native buffers must be NumPy arrays")
@@ -102,5 +115,5 @@ def addr(array: np.ndarray) -> int:
         and array.dtype in _NATIVE_DTYPES
         and array.size != 0
     ):
-        return int(array.ctypes.data)
+        return _data_pointer(array)
     _reject(array)

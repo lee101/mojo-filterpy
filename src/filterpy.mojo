@@ -62,6 +62,55 @@ def add_scaled(dst: Ptr, src: Ptr, scale: Float64, count: Int):
         i += 1
 
 
+def row_gemm(
+    dst: Ptr, coeffs: Ptr, src: Ptr, inner: Int, cols: Int, scale: Float64
+):
+    var j = 0
+    var scales = SIMD[DType.float64, W](scale)
+    while j + W <= cols:
+        var acc = SIMD[DType.float64, W](0.0)
+        for t in range(inner):
+            acc += coeffs[t] * src.load[width=W](t * cols + j)
+        dst.store(j, scales * acc)
+        j += W
+    while j < cols:
+        var accs = 0.0
+        for t in range(inner):
+            accs += coeffs[t] * src[t * cols + j]
+        dst[j] = scale * accs
+        j += 1
+
+
+def row_gemm_bias(
+    dst: Ptr, coeffs: Ptr, src: Ptr, bias: Ptr, inner: Int, cols: Int, scale: Float64
+):
+    var j = 0
+    var scales = SIMD[DType.float64, W](scale)
+    while j + W <= cols:
+        var acc = SIMD[DType.float64, W](0.0)
+        for t in range(inner):
+            acc += coeffs[t] * src.load[width=W](t * cols + j)
+        dst.store(j, scales * acc + bias.load[width=W](j))
+        j += W
+    while j < cols:
+        var accs = 0.0
+        for t in range(inner):
+            accs += coeffs[t] * src[t * cols + j]
+        dst[j] = scale * accs + bias[j]
+        j += 1
+
+
+def transpose(src: Ptr, dst: Ptr, rows: Int, cols: Int):
+    var i = 0
+    while i < rows:
+        var s = src + i * cols
+        var j = 0
+        while j < cols:
+            dst[j * rows + i] = s[j]
+            j += 1
+        i += 1
+
+
 def invert(a: Ptr, inv: Ptr, work: Ptr, n: Int) -> Bool:
     copy_values(work, a, n * n)
     fill_values(inv, 0.0, n * n)
@@ -153,7 +202,9 @@ def mfp_predict(
     var f = p(f_addr)
     var q = p(q_addr)
     var xw = p(x_work_addr)
-    var pw = p(p_work_addr)
+    var work = p(p_work_addr)
+    var pw = work
+    var ft = work + n * n
     for i in range(n):
         xw[i] = dot(f + i * n, x, n)
     if nu > 0:
@@ -162,14 +213,10 @@ def mfp_predict(
         for i in range(n):
             xw[i] += dot(b + i * nu, u, nu)
     for i in range(n):
-        fill_values(pw + i * n, 0.0, n)
-        for a in range(n):
-            add_scaled(pw + i * n, cov + a * n, f[i * n + a], n)
+        row_gemm(pw + i * n, f + i * n, cov, n, n, 1.0)
+    transpose(f, ft, n, n)
     for i in range(n):
-        for j in range(n):
-            cov[i * n + j] = (
-                alpha_sq * dot(pw + i * n, f + j * n, n) + q[i * n + j]
-            )
+        row_gemm_bias(cov + i * n, pw + i * n, ft, q + i * n, n, n, alpha_sq)
     copy_values(x, xw, n)
 
 
@@ -200,34 +247,24 @@ def mfp_linear_update(
         for j in range(m):
             gain[i * m + j] = dot(cov + i * n, h + j * n, n)
     for i in range(m):
-        copy_values(s + i * m, r + i * m, m)
-        for a in range(n):
-            add_scaled(s + i * m, gain + a * m, h[i * n + a], m)
+        row_gemm_bias(s + i * m, h + i * n, gain, r + i * m, n, m, 1.0)
     if not invert(s, si, work + 2 * n * n, m):
         return 0
     var product = work + 2 * n * n + m * m
     for i in range(n):
-        fill_values(product + i * m, 0.0, m)
-        for a in range(m):
-            add_scaled(product + i * m, si + a * m, gain[i * m + a], m)
+        row_gemm(product + i * m, gain + i * m, si, m, m, 1.0)
     copy_values(gain, product, n * m)
     for i in range(n):
         x[i] += dot(gain + i * m, y, m)
     var ikh = work
     var ap = work + n * n
     for i in range(n):
-        fill_values(ikh + i * n, 0.0, n)
-        ikh[i * n + i] = 1.0
-        for a in range(m):
-            add_scaled(ikh + i * n, h + a * n, -gain[i * m + a], n)
+        row_gemm(ikh + i * n, gain + i * m, h, m, n, -1.0)
+        ikh[i * n + i] += 1.0
     for i in range(n):
-        fill_values(ap + i * n, 0.0, n)
-        for a in range(n):
-            add_scaled(ap + i * n, cov + a * n, ikh[i * n + a], n)
+        row_gemm(ap + i * n, ikh + i * n, cov, n, n, 1.0)
     for i in range(n):
-        fill_values(product + i * m, 0.0, m)
-        for a in range(m):
-            add_scaled(product + i * m, r + a * m, gain[i * m + a], m)
+        row_gemm(product + i * m, gain + i * m, r, m, m, 1.0)
     for i in range(n):
         for j in range(n):
             cov[i * n + j] = (
@@ -273,13 +310,7 @@ def mfp_unscented_transform(
     for i in range(n):
         var cr = cov + i * n
         var nr = noise + i * n
-        var j = i
-        while j < n and j % W != 0:
-            var lead = nr[j]
-            for s in range(k):
-                lead += wc[s] * dev[s * n + i] * dev[s * n + j]
-            cr[j] = lead
-            j += 1
+        var j = 0
         while j + BLOCK <= n:
             var a0 = nr.load[width=W](j)
             var a1 = nr.load[width=W](j + W)
@@ -309,10 +340,6 @@ def mfp_unscented_transform(
                 accs += wc[s] * dev[s * n + i] * dev[s * n + j]
             cr[j] = accs
             j += 1
-    for i in range(n):
-        var ir = cov + i * n
-        for j in range(i + 1, n):
-            cov[j * n + i] = ir[j]
 
 
 def ut_mean_gpu(
@@ -515,31 +542,53 @@ def mfp_resample_sorted(
 
 @export("mfp_resample_binary")
 def mfp_resample_binary(
-    cumulative_addr: Int, positions_addr: Int, indexes_addr: Int, n: Int
+    cumulative_addr: Int,
+    positions_addr: Int,
+    indexes_addr: Int,
+    table_addr: Int,
+    n: Int,
+    buckets: Int,
 ) abi("C"):
     var cumulative = p(cumulative_addr)
     var positions = p(positions_addr)
     var indexes = ip(indexes_addr)
+    var table = ip(table_addr)
+    var scale = Float64(buckets)
 
-    comptime chunk_size = 4096
-    var chunks = (n + chunk_size - 1) // chunk_size
-
-    # Latency-bound: one binary search per position, each step touching a
-    # single 8-byte word deep in the cumulative array, so ~17 flops per
-    # 136 bytes of traffic. Far below the 2 flops/byte where chunking pays.
-    for chunk in range(chunks):
-        var begin = chunk * chunk_size
-        var end = min(begin + chunk_size, n)
-        for i in range(begin, end):
-            var lo = 0
-            var hi = n
-            while lo < hi:
-                var mid = (lo + hi) // 2
-                if positions[i] < cumulative[mid]:
-                    hi = mid
-                else:
-                    lo = mid + 1
-            indexes[i] = Int64(min(lo, n - 1))
+    # table[b] counts the entries whose bucket index is below b. Bucket index
+    # is a monotone function of the value, so an entry at or below a position
+    # always lands in a bucket at or below the position's bucket: the answer
+    # is provably inside [table[b], table[b + 1]], which turns an
+    # O(log n) search over the whole array into O(log(n / buckets)).
+    var idx = 0
+    for b in range(buckets + 2):
+        while idx < n:
+            var slot = Int(cumulative[idx] * scale)
+            if slot < 0:
+                slot = 0
+            elif slot > buckets:
+                slot = buckets
+            if slot < b:
+                idx += 1
+            else:
+                break
+        table[b] = Int64(idx)
+    for i in range(n):
+        var position = positions[i]
+        var b = Int(position * scale)
+        if b < 0:
+            b = 0
+        elif b > buckets:
+            b = buckets
+        var lo = Int(table[b])
+        var hi = Int(table[b + 1])
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if position < cumulative[mid]:
+                hi = mid
+            else:
+                lo = mid + 1
+        indexes[i] = Int64(min(lo, n - 1))
 
 
 @export("mfp_neff")

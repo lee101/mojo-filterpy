@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .._lib import addr, f64, i64, lib
+from .._lib import addr, bucket_count, f64, i64, lib, scratch
 
 
 def _weights(weights):
@@ -41,8 +41,11 @@ def multinomial_resample(weights):
     indexes = np.empty(weights.size, dtype=np.int64)
     cumulative = f64(np.cumsum(weights))
     cumulative[-1] = 1.0
+    n = weights.size
+    _, table_addr = scratch(bucket_count(n) + 2, np.int64)
     lib().mfp_resample_binary(
-        addr(cumulative), addr(positions), addr(indexes), weights.size
+        addr(cumulative), addr(positions), addr(indexes), table_addr, n,
+        bucket_count(n),
     )
     return indexes
 
@@ -65,7 +68,11 @@ def residual_resample(weights):
     all_indexes = np.empty(n, dtype=np.int64)
     cumulative = f64(np.cumsum(residual))
     cumulative[-1] = 1.0
-    lib().mfp_resample_binary(addr(cumulative), addr(padded), addr(all_indexes), n)
+    _, table_addr = scratch(bucket_count(n) + 2, np.int64)
+    lib().mfp_resample_binary(
+        addr(cumulative), addr(padded), addr(all_indexes), table_addr, n,
+        bucket_count(n),
+    )
     sampled[:] = all_indexes[:remaining]
     return np.concatenate((deterministic, sampled)).astype(np.int32)
 
