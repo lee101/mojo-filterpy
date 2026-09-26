@@ -1,8 +1,7 @@
 """Dense filtering kernels exposed through one C ABI compilation unit."""
 
-from std.algorithm import parallelize
-from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu import global_idx
+from max.gpu.host import DeviceContext
 from std.sys import simd_width_of
 
 comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -259,7 +258,11 @@ def mfp_unscented_transform(
     for i in range(k):
         add_scaled(mean, sigmas + i * n, wm[i], n)
 
-    def covariance_row(i: Int) capturing:
+    # Memory-bound: per output element this touches the covariance row, the
+    # sigma row and the mean row (24-32 bytes) for ~4 flops, well under
+    # 2 flops/byte, and the k passes re-stream those rows from memory. The
+    # row loop therefore runs serially.
+    for i in range(n):
         copy_values(cov + i * n, noise + i * n, n)
         for sidx in range(k):
             var scale = wc[sidx] * (sigmas[sidx * n + i] - mean[i])
@@ -280,19 +283,17 @@ def mfp_unscented_transform(
                 cov[i * n + j] += scale * (sigmas[sidx * n + j] - mean[j])
                 j += 1
 
-    if k * n * n >= 1000000:
-        parallelize[covariance_row](n, 8)
-    else:
-        for i in range(n):
-            covariance_row(i)
 
-
-def ut_mean_gpu(sigmas: Ptr, wm: Ptr, mean: Ptr, k: Int, n: Int):
+def ut_mean_gpu(
+    sigmas: Ptr, wm: Ptr, mean: Ptr, k: Int32, n: Int32
+):
     var j = Int(global_idx.x)
-    if j < n:
+    var kk = Int(k)
+    var nn = Int(n)
+    if j < nn:
         var acc = 0.0
-        for i in range(k):
-            acc += wm[i] * sigmas[i * n + j]
+        for i in range(kk):
+            acc += wm[i] * sigmas[i * nn + j]
         mean[j] = acc
 
 
@@ -302,17 +303,19 @@ def ut_cov_gpu(
     noise: Ptr,
     mean: Ptr,
     cov: Ptr,
-    k: Int,
-    n: Int,
+    k: Int32,
+    n: Int32,
 ):
     var index = Int(global_idx.x)
-    if index < n * n:
-        var row = index // n
-        var col = index - row * n
+    var kk = Int(k)
+    var nn = Int(n)
+    if index < nn * nn:
+        var row = index // nn
+        var col = index - row * nn
         var acc = noise[index]
-        for sidx in range(k):
-            acc += wc[sidx] * (sigmas[sidx * n + row] - mean[row]) * (
-                sigmas[sidx * n + col] - mean[col]
+        for sidx in range(kk):
+            acc += wc[sidx] * (sigmas[sidx * nn + row] - mean[row]) * (
+                sigmas[sidx * nn + col] - mean[col]
             )
         cov[index] = acc
 
@@ -375,8 +378,8 @@ def mfp_unscented_transform_gpu(
             d_sigmas,
             d_wm,
             d_mean,
-            k,
-            n,
+            Int32(k),
+            Int32(n),
             grid_dim=(n + block_size - 1) // block_size,
             block_dim=block_size,
         )
@@ -386,8 +389,8 @@ def mfp_unscented_transform_gpu(
             d_noise,
             d_mean,
             d_cov,
-            k,
-            n,
+            Int32(k),
+            Int32(n),
             grid_dim=(n * n + block_size - 1) // block_size,
             block_dim=block_size,
         )
@@ -496,39 +499,25 @@ def mfp_resample_binary(
     var positions = p(positions_addr)
     var indexes = ip(indexes_addr)
 
-    def search(i: Int) capturing:
-        var lo = 0
-        var hi = n
-        while lo < hi:
-            var mid = (lo + hi) // 2
-            if positions[i] < cumulative[mid]:
-                hi = mid
-            else:
-                lo = mid + 1
-        indexes[i] = Int64(min(lo, n - 1))
+    comptime chunk_size = 4096
+    var chunks = (n + chunk_size - 1) // chunk_size
 
-    if n >= 32768:
-        comptime chunk_size = 4096
-        var chunks = (n + chunk_size - 1) // chunk_size
-
-        def search_chunk(chunk: Int) capturing:
-            var begin = chunk * chunk_size
-            var end = min(begin + chunk_size, n)
-            for i in range(begin, end):
-                var lo = 0
-                var hi = n
-                while lo < hi:
-                    var mid = (lo + hi) // 2
-                    if positions[i] < cumulative[mid]:
-                        hi = mid
-                    else:
-                        lo = mid + 1
-                indexes[i] = Int64(min(lo, n - 1))
-
-        parallelize[search_chunk](chunks, 8)
-    else:
-        for i in range(n):
-            search(i)
+    # Latency-bound: one binary search per position, each step touching a
+    # single 8-byte word deep in the cumulative array, so ~17 flops per
+    # 136 bytes of traffic. Far below the 2 flops/byte where chunking pays.
+    for chunk in range(chunks):
+        var begin = chunk * chunk_size
+        var end = min(begin + chunk_size, n)
+        for i in range(begin, end):
+            var lo = 0
+            var hi = n
+            while lo < hi:
+                var mid = (lo + hi) // 2
+                if positions[i] < cumulative[mid]:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            indexes[i] = Int64(min(lo, n - 1))
 
 
 @export("mfp_neff")
