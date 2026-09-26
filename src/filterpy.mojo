@@ -245,6 +245,7 @@ def mfp_unscented_transform(
     noise_addr: Int,
     mean_addr: Int,
     cov_addr: Int,
+    dev_addr: Int,
     k: Int,
     n: Int,
 ) abi("C"):
@@ -254,34 +255,64 @@ def mfp_unscented_transform(
     var noise = p(noise_addr)
     var mean = p(mean_addr)
     var cov = p(cov_addr)
+    var dev = p(dev_addr)
     fill_values(mean, 0.0, n)
-    for i in range(k):
-        add_scaled(mean, sigmas + i * n, wm[i], n)
-
-    # Memory-bound: per output element this touches the covariance row, the
-    # sigma row and the mean row (24-32 bytes) for ~4 flops, well under
-    # 2 flops/byte, and the k passes re-stream those rows from memory. The
-    # row loop therefore runs serially.
+    for s in range(k):
+        add_scaled(mean, sigmas + s * n, wm[s], n)
+    for s in range(k):
+        var sr = sigmas + s * n
+        var dr = dev + s * n
+        var j = 0
+        while j + W <= n:
+            dr.store(j, sr.load[width=W](j) - mean.load[width=W](j))
+            j += W
+        while j < n:
+            dr[j] = sr[j] - mean[j]
+            j += 1
+    comptime BLOCK = 4 * W
     for i in range(n):
-        copy_values(cov + i * n, noise + i * n, n)
-        for sidx in range(k):
-            var scale = wc[sidx] * (sigmas[sidx * n + i] - mean[i])
-            var j = 0
-            var scales = SIMD[DType.float64, W](scale)
-            while j + W <= n:
-                cov.store(
-                    i * n + j,
-                    cov.load[width=W](i * n + j)
-                    + scales
-                    * (
-                        sigmas.load[width=W](sidx * n + j)
-                        - mean.load[width=W](j)
-                    ),
-                )
-                j += W
-            while j < n:
-                cov[i * n + j] += scale * (sigmas[sidx * n + j] - mean[j])
-                j += 1
+        var cr = cov + i * n
+        var nr = noise + i * n
+        var j = i
+        while j < n and j % W != 0:
+            var lead = nr[j]
+            for s in range(k):
+                lead += wc[s] * dev[s * n + i] * dev[s * n + j]
+            cr[j] = lead
+            j += 1
+        while j + BLOCK <= n:
+            var a0 = nr.load[width=W](j)
+            var a1 = nr.load[width=W](j + W)
+            var a2 = nr.load[width=W](j + 2 * W)
+            var a3 = nr.load[width=W](j + 3 * W)
+            for s in range(k):
+                var w = wc[s] * dev[s * n + i]
+                var row = dev + s * n
+                a0 += w * row.load[width=W](j)
+                a1 += w * row.load[width=W](j + W)
+                a2 += w * row.load[width=W](j + 2 * W)
+                a3 += w * row.load[width=W](j + 3 * W)
+            cr.store(j, a0)
+            cr.store(j + W, a1)
+            cr.store(j + 2 * W, a2)
+            cr.store(j + 3 * W, a3)
+            j += BLOCK
+        while j + W <= n:
+            var acc = nr.load[width=W](j)
+            for s in range(k):
+                acc += (wc[s] * dev[s * n + i]) * dev.load[width=W](s * n + j)
+            cr.store(j, acc)
+            j += W
+        while j < n:
+            var accs = nr[j]
+            for s in range(k):
+                accs += wc[s] * dev[s * n + i] * dev[s * n + j]
+            cr[j] = accs
+            j += 1
+    for i in range(n):
+        var ir = cov + i * n
+        for j in range(i + 1, n):
+            cov[j * n + i] = ir[j]
 
 
 def ut_mean_gpu(
@@ -328,28 +359,18 @@ def mfp_unscented_transform_gpu(
     noise_addr: Int,
     mean_addr: Int,
     cov_addr: Int,
+    dev_addr: Int,
     k: Int,
     n: Int,
 ) abi("C") -> Int:
-    if k * n + 2 * k + 2 * n * n + n > 240000000:
-        mfp_unscented_transform(
-            sigmas_addr,
-            wm_addr,
-            wc_addr,
-            noise_addr,
-            mean_addr,
-            cov_addr,
-            k,
-            n,
-        )
-        return 0
+    var sigmas = p(sigmas_addr)
+    var wm = p(wm_addr)
+    var wc = p(wc_addr)
+    var noise = p(noise_addr)
+    var mean = p(mean_addr)
+    var cov = p(cov_addr)
+    var dev = p(dev_addr)
     try:
-        var sigmas = p(sigmas_addr)
-        var wm = p(wm_addr)
-        var wc = p(wc_addr)
-        var noise = p(noise_addr)
-        var mean = p(mean_addr)
-        var cov = p(cov_addr)
         var ctx = DeviceContext()
         if ctx.api() == "cpu":
             mfp_unscented_transform(
@@ -359,6 +380,7 @@ def mfp_unscented_transform_gpu(
                 noise_addr,
                 mean_addr,
                 cov_addr,
+                dev_addr,
                 k,
                 n,
             )

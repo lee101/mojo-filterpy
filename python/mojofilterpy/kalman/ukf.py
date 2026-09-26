@@ -3,8 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import numpy as np
-
-from .._lib import addr, f64, lib
+from .._lib import addr, f64, lib, scratch
 from .._stats import LikelihoodMixin
 
 
@@ -37,13 +36,15 @@ def unscented_transform(
     mean = np.empty(n, dtype=np.float64)
     cov = np.empty((n, n), dtype=np.float64)
     use_gpu = device == "gpu" and k * n * n >= 4_000_000
+    _, dev_addr = scratch(k * n)
     kernel = (
         lib().mfp_unscented_transform_gpu
         if use_gpu
         else lib().mfp_unscented_transform
     )
     status = kernel(
-        addr(sigmas), addr(Wm), addr(Wc), addr(noise), addr(mean), addr(cov), k, n
+        addr(sigmas), addr(Wm), addr(Wc), addr(noise), addr(mean), addr(cov),
+        dev_addr, k, n,
     )
     if use_gpu and status < 0:
         raise RuntimeError("Mojo GPU unscented transform failed")
